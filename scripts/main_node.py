@@ -9,20 +9,17 @@ from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 from resit_coursework.msg import HotelRequest
+from sound_play.libsoundplay import SoundClient
 
 # --- Global Variables & Callbacks ---
 
 request_lock = threading.Lock()
 latest_request = None
 
-# --- New Event-based system for YOLO detection ---
 yolo_detection_lock = threading.Lock()
-# This Event will signal when the correct object is found
 object_found_event = threading.Event()
-# This will hold the item the SearchForObject state is looking for
 target_search_item = ""
 
-# Using the correct coordinates from your GitHub repository.
 ROOM_COORDINATES = {
     'A': (2.0, 8.0, 1.0),  # Pantry
     'B': (6.0, 8.0, 1.0),  # Guest Room
@@ -32,7 +29,6 @@ ROOM_COORDINATES = {
     'F': (10.0, 3.0, 1.0)  # Guest Room
 }
 
-
 def request_callback(message):
     global latest_request
     with request_lock:
@@ -40,20 +36,13 @@ def request_callback(message):
         rospy.loginfo("Room: %s, Request: %s", message.room, message.request)
         latest_request = message
 
-
 def yolo_callback(message):
-    """Callback that checks for the target object and sets an event."""
     global target_search_item
-
     detected_object = message.data.strip()
-    rospy.loginfo(f"YOLO callback received: {detected_object}")
-
     with yolo_detection_lock:
-        # If the detected object is the one we're looking for, set the event
         if target_search_item and detected_object == target_search_item:
             rospy.loginfo(f"Matching object '{detected_object}' found! Setting event.")
             object_found_event.set()
-
 
 # --- SMACH States ---
 
@@ -76,11 +65,11 @@ class WaitForRequest(smach.State):
             userdata.item_out = latest_request.request
         return 'request_received'
 
-
 class NavigateTo(smach.State):
-    def __init__(self, target_room_name):
-        smach.State.__init__(self, outcomes=['succeeded', 'aborted'])
-        self.target_room_name = target_room_name
+    def __init__(self, target_room_key=None):
+        # target_room_key can be a fixed string (like 'A') or None to use userdata
+        smach.State.__init__(self, outcomes=['succeeded', 'aborted'], input_keys=['room_in'])
+        self.target_room_key = target_room_key
         self.move_base_client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
         rospy.loginfo("Waiting for 'move_base' action server...")
         if not self.move_base_client.wait_for_server(rospy.Duration(5.0)):
@@ -89,13 +78,13 @@ class NavigateTo(smach.State):
             rospy.loginfo("'move_base' action server found.")
 
     def execute(self, userdata):
-        if not self.move_base_client.wait_for_server(rospy.Duration(1.0)):
-            rospy.logerr("'move_base' action server not available. Aborting navigation.")
-            return 'aborted'
-        rospy.loginfo(f"Executing state: NavigateTo {self.target_room_name}")
-        coords = ROOM_COORDINATES.get(self.target_room_name)
+        # If a fixed key is provided, use it. Otherwise, use the key from userdata.
+        room_key = self.target_room_key if self.target_room_key else userdata.room_in
+
+        rospy.loginfo(f"Executing state: NavigateTo Room {room_key}")
+        coords = ROOM_COORDINATES.get(room_key)
         if not coords:
-            rospy.logerr(f"Unknown room: {self.target_room_name}. Aborting navigation.")
+            rospy.logerr(f"Unknown room: {room_key}. Aborting navigation.")
             return 'aborted'
         goal = MoveBaseGoal()
         goal.target_pose.header.frame_id = "map"
@@ -106,54 +95,53 @@ class NavigateTo(smach.State):
         self.move_base_client.send_goal(goal)
         self.move_base_client.wait_for_result()
         if self.move_base_client.get_state() == actionlib.GoalStatus.SUCCEEDED:
-            rospy.loginfo(f"Successfully navigated to {self.target_room_name}.")
+            rospy.loginfo(f"Successfully navigated to Room {room_key}.")
             return 'succeeded'
         else:
-            rospy.logerr(f"Failed to navigate to {self.target_room_name}.")
+            rospy.logerr(f"Failed to navigate to Room {room_key}.")
             return 'aborted'
-
 
 class SearchForObject(smach.State):
     def __init__(self):
         smach.State.__init__(self, outcomes=['succeeded', 'aborted'],
                              input_keys=['item_in'])
         self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
-        self.rate = rospy.Rate(10)
 
     def execute(self, userdata):
         global target_search_item, object_found_event
-
-        # Set the global target item so the callback knows what to look for
         with yolo_detection_lock:
             target_search_item = userdata.item_in.strip()
-            object_found_event.clear()  # Clear the event from any previous runs
-
+            object_found_event.clear()
         rospy.loginfo(f"Executing state: SearchForObject. Looking for a '{target_search_item}'.")
-
         turn_cmd = Twist()
         turn_cmd.angular.z = 0.5
-
         while not rospy.is_shutdown():
-            # Keep turning the robot
             self.cmd_vel_pub.publish(turn_cmd)
-
-            # Wait for the yolo_callback to signal that the object was found.
-            # We add a timeout so the loop continues and keeps publishing the turn command.
             event_is_set = object_found_event.wait(timeout=0.1)
-
             if event_is_set:
                 rospy.loginfo(f"SUCCESS: Event received, found '{target_search_item}'!")
-                # Stop the robot
                 self.cmd_vel_pub.publish(Twist())
-                # Clear the target item so the callback stops looking
                 with yolo_detection_lock:
                     target_search_item = ""
                 return 'succeeded'
-
-        # This part is reached if rospy is shutdown
         self.cmd_vel_pub.publish(Twist())
         return 'aborted'
 
+class Speak(smach.State):
+    def __init__(self, text_to_speak):
+        smach.State.__init__(self, outcomes=['succeeded'], input_keys=['item_in'])
+        self.text_template = text_to_speak
+        self.sound_client = SoundClient(blocking=True)
+
+    def execute(self, userdata):
+        if '{item}' in self.text_template:
+            final_text = self.text_template.format(item=userdata.item_in)
+        else:
+            final_text = self.text_template
+        rospy.loginfo(f"Executing state: Speak. Saying: '{final_text}'")
+        self.sound_client.say(final_text)
+        rospy.sleep(1)
+        return 'succeeded'
 
 def main():
     rospy.init_node('main_node')
@@ -174,16 +162,24 @@ def main():
                                transitions={'succeeded': 'SEARCH_FOR_OBJECT', 'aborted': 'WAIT_FOR_REQUEST'})
 
         smach.StateMachine.add('SEARCH_FOR_OBJECT', SearchForObject(),
+                               transitions={'succeeded': 'ANNOUNCE_OBJECT_FOUND', 'aborted': 'WAIT_FOR_REQUEST'},
+                               remapping={'item_in': 'item'})
+
+        smach.StateMachine.add('ANNOUNCE_OBJECT_FOUND', Speak("I have found the {item}"),
+                               transitions={'succeeded': 'GO_TO_DELIVERY_ROOM'},  # <-- Updated transition
+                               remapping={'item_in': 'item'})
+
+        # Add the new navigation state for the delivery
+        smach.StateMachine.add('GO_TO_DELIVERY_ROOM', NavigateTo(),  # <-- No fixed key, so it uses userdata
                                transitions={'succeeded': 'WAIT_FOR_REQUEST',  # For now, loop back
                                             'aborted': 'WAIT_FOR_REQUEST'},
-                               remapping={'item_in': 'item'})
+                               remapping={'room_in': 'room'})  # <-- Pass the room from userdata
 
     sis = smach_ros.IntrospectionServer('smach_server', sm, '/SM_ROOT')
     sis.start()
     outcome = sm.execute()
     rospy.spin()
     sis.stop()
-
 
 if __name__ == '__main__':
     try:
