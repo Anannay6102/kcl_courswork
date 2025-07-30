@@ -60,7 +60,7 @@ class YoloDetector:
                 scores = detection[5:]
                 class_id = np.argmax(scores)
                 confidence = scores[class_id]
-                if confidence > 0.5:  # Adjusted confidence for better detection
+                if confidence > 0.75:  # Adjusted confidence for better detection
                     label = str(self.classes[class_id])
                     self.detection_publisher.publish(label)
                     rospy.loginfo(f"Detected: {label} with confidence {confidence:.2f}")

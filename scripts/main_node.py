@@ -14,18 +14,24 @@ from resit_coursework.msg import HotelRequest
 
 request_lock = threading.Lock()
 latest_request = None
-yolo_detection_lock = threading.Lock()
-last_detection = None
 
-# Using calibrated coordinates from the previous step
+# --- New Event-based system for YOLO detection ---
+yolo_detection_lock = threading.Lock()
+# This Event will signal when the correct object is found
+object_found_event = threading.Event()
+# This will hold the item the SearchForObject state is looking for
+target_search_item = ""
+
+# Using the correct coordinates from your GitHub repository.
 ROOM_COORDINATES = {
     'A': (2.0, 8.0, 1.0),  # Pantry
     'B': (6.0, 8.0, 1.0),  # Guest Room
     'C': (10.0, 8.0, 1.0),  # Guest Room
     'D': (2.0, 3.0, 1.0),  # Front Desk
     'E': (6.0, 3.0, 1.0),  # Lobby
-    'F': (10.0, 3.0, 1.0)
+    'F': (10.0, 3.0, 1.0)  # Guest Room
 }
+
 
 def request_callback(message):
     global latest_request
@@ -36,10 +42,17 @@ def request_callback(message):
 
 
 def yolo_callback(message):
-    """Callback to store the latest YOLO detection."""
-    global last_detection
+    """Callback that checks for the target object and sets an event."""
+    global target_search_item
+
+    detected_object = message.data.strip()
+    rospy.loginfo(f"YOLO callback received: {detected_object}")
+
     with yolo_detection_lock:
-        last_detection = message.data
+        # If the detected object is the one we're looking for, set the event
+        if target_search_item and detected_object == target_search_item:
+            rospy.loginfo(f"Matching object '{detected_object}' found! Setting event.")
+            object_found_event.set()
 
 
 # --- SMACH States ---
@@ -105,42 +118,46 @@ class SearchForObject(smach.State):
         smach.State.__init__(self, outcomes=['succeeded', 'aborted'],
                              input_keys=['item_in'])
         self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
-        self.rate = rospy.Rate(10)  # 10hz
+        self.rate = rospy.Rate(10)
 
     def execute(self, userdata):
-        global last_detection
-        rospy.loginfo(f"Executing state: SearchForObject. Looking for a '{userdata.item_in}'.")
+        global target_search_item, object_found_event
 
-        # Clear any old detections
+        # Set the global target item so the callback knows what to look for
         with yolo_detection_lock:
-            last_detection = None
+            target_search_item = userdata.item_in.strip()
+            object_found_event.clear()  # Clear the event from any previous runs
 
-        # Create a rotation command
+        rospy.loginfo(f"Executing state: SearchForObject. Looking for a '{target_search_item}'.")
+
         turn_cmd = Twist()
-        turn_cmd.angular.z = 0.5  # radians per second
+        turn_cmd.angular.z = 0.5
 
-        # Loop until the object is found or ROS is shut down
         while not rospy.is_shutdown():
-            # Publish the turn command to make the robot rotate
+            # Keep turning the robot
             self.cmd_vel_pub.publish(turn_cmd)
 
-            with yolo_detection_lock:
-                if last_detection and last_detection == userdata.item_in:
-                    rospy.loginfo(f"SUCCESS: Found '{userdata.item_in}'!")
-                    # Stop the robot
-                    self.cmd_vel_pub.publish(Twist())  # Empty Twist stops the robot
-                    return 'succeeded'
+            # Wait for the yolo_callback to signal that the object was found.
+            # We add a timeout so the loop continues and keeps publishing the turn command.
+            event_is_set = object_found_event.wait(timeout=0.1)
 
-            self.rate.sleep()
+            if event_is_set:
+                rospy.loginfo(f"SUCCESS: Event received, found '{target_search_item}'!")
+                # Stop the robot
+                self.cmd_vel_pub.publish(Twist())
+                # Clear the target item so the callback stops looking
+                with yolo_detection_lock:
+                    target_search_item = ""
+                return 'succeeded'
 
         # This part is reached if rospy is shutdown
+        self.cmd_vel_pub.publish(Twist())
         return 'aborted'
 
 
 def main():
     rospy.init_node('main_node')
 
-    # Subscribe to the necessary topics
     rospy.Subscriber('/hotel_request', HotelRequest, request_callback)
     rospy.Subscriber('/yolo_detections', String, yolo_callback)
 
