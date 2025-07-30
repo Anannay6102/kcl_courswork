@@ -29,12 +29,14 @@ ROOM_COORDINATES = {
     'F': (10.0, 3.0, 1.0)  # Guest Room
 }
 
+
 def request_callback(message):
     global latest_request
     with request_lock:
         rospy.loginfo("--- New Request Received ---")
         rospy.loginfo("Room: %s, Request: %s", message.room, message.request)
         latest_request = message
+
 
 def yolo_callback(message):
     global target_search_item
@@ -43,6 +45,7 @@ def yolo_callback(message):
         if target_search_item and detected_object == target_search_item:
             rospy.loginfo(f"Matching object '{detected_object}' found! Setting event.")
             object_found_event.set()
+
 
 # --- SMACH States ---
 
@@ -65,9 +68,9 @@ class WaitForRequest(smach.State):
             userdata.item_out = latest_request.request
         return 'request_received'
 
+
 class NavigateTo(smach.State):
     def __init__(self, target_room_key=None):
-        # target_room_key can be a fixed string (like 'A') or None to use userdata
         smach.State.__init__(self, outcomes=['succeeded', 'aborted'], input_keys=['room_in'])
         self.target_room_key = target_room_key
         self.move_base_client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
@@ -78,9 +81,7 @@ class NavigateTo(smach.State):
             rospy.loginfo("'move_base' action server found.")
 
     def execute(self, userdata):
-        # If a fixed key is provided, use it. Otherwise, use the key from userdata.
         room_key = self.target_room_key if self.target_room_key else userdata.room_in
-
         rospy.loginfo(f"Executing state: NavigateTo Room {room_key}")
         coords = ROOM_COORDINATES.get(room_key)
         if not coords:
@@ -101,6 +102,7 @@ class NavigateTo(smach.State):
             rospy.logerr(f"Failed to navigate to Room {room_key}.")
             return 'aborted'
 
+
 class SearchForObject(smach.State):
     def __init__(self):
         smach.State.__init__(self, outcomes=['succeeded', 'aborted'],
@@ -117,8 +119,7 @@ class SearchForObject(smach.State):
         turn_cmd.angular.z = 0.5
         while not rospy.is_shutdown():
             self.cmd_vel_pub.publish(turn_cmd)
-            event_is_set = object_found_event.wait(timeout=0.1)
-            if event_is_set:
+            if object_found_event.wait(timeout=0.1):
                 rospy.loginfo(f"SUCCESS: Event received, found '{target_search_item}'!")
                 self.cmd_vel_pub.publish(Twist())
                 with yolo_detection_lock:
@@ -127,6 +128,7 @@ class SearchForObject(smach.State):
         self.cmd_vel_pub.publish(Twist())
         return 'aborted'
 
+
 class Speak(smach.State):
     def __init__(self, text_to_speak):
         smach.State.__init__(self, outcomes=['succeeded'], input_keys=['item_in'])
@@ -134,14 +136,46 @@ class Speak(smach.State):
         self.sound_client = SoundClient(blocking=True)
 
     def execute(self, userdata):
-        if '{item}' in self.text_template:
-            final_text = self.text_template.format(item=userdata.item_in)
-        else:
-            final_text = self.text_template
+        final_text = self.text_template.format(
+            item=userdata.item_in) if '{item}' in self.text_template else self.text_template
         rospy.loginfo(f"Executing state: Speak. Saying: '{final_text}'")
         self.sound_client.say(final_text)
         rospy.sleep(1)
         return 'succeeded'
+
+
+class CheckForPerson(smach.State):
+    def __init__(self, search_duration=10.0):
+        smach.State.__init__(self, outcomes=['person_found', 'person_not_found', 'aborted'])
+        self.search_duration = rospy.Duration(search_duration)
+        self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+
+    def execute(self, userdata):
+        global target_search_item, object_found_event
+        rospy.loginfo("Executing state: CheckForPerson. Scanning room for a person.")
+        with yolo_detection_lock:
+            target_search_item = "person"
+            object_found_event.clear()
+        start_time = rospy.Time.now()
+        turn_cmd = Twist()
+        turn_cmd.angular.z = 0.3
+        while (rospy.Time.now() - start_time) < self.search_duration:
+            if rospy.is_shutdown():
+                self.cmd_vel_pub.publish(Twist())
+                return 'aborted'
+            self.cmd_vel_pub.publish(turn_cmd)
+            if object_found_event.wait(timeout=0.1):
+                rospy.loginfo("SUCCESS: Person found in the room!")
+                self.cmd_vel_pub.publish(Twist())
+                with yolo_detection_lock:
+                    target_search_item = ""
+                return 'person_found'
+        rospy.loginfo("FAIL: No person found after scanning for the full duration.")
+        self.cmd_vel_pub.publish(Twist())
+        with yolo_detection_lock:
+            target_search_item = ""
+        return 'person_not_found'
+
 
 def main():
     rospy.init_node('main_node')
@@ -159,27 +193,46 @@ def main():
                                remapping={'room_out': 'room', 'item_out': 'item'})
 
         smach.StateMachine.add('GO_TO_PANTRY', NavigateTo('A'),
-                               transitions={'succeeded': 'SEARCH_FOR_OBJECT', 'aborted': 'WAIT_FOR_REQUEST'})
+                               transitions={'succeeded': 'SEARCH_FOR_OBJECT', 'aborted': 'GO_TO_LOBBY'})
 
         smach.StateMachine.add('SEARCH_FOR_OBJECT', SearchForObject(),
-                               transitions={'succeeded': 'ANNOUNCE_OBJECT_FOUND', 'aborted': 'WAIT_FOR_REQUEST'},
+                               transitions={'succeeded': 'ANNOUNCE_OBJECT_FOUND', 'aborted': 'GO_TO_LOBBY'},
                                remapping={'item_in': 'item'})
 
         smach.StateMachine.add('ANNOUNCE_OBJECT_FOUND', Speak("I have found the {item}"),
-                               transitions={'succeeded': 'GO_TO_DELIVERY_ROOM'},  # <-- Updated transition
+                               transitions={'succeeded': 'GO_TO_DELIVERY_ROOM'},
                                remapping={'item_in': 'item'})
 
-        # Add the new navigation state for the delivery
-        smach.StateMachine.add('GO_TO_DELIVERY_ROOM', NavigateTo(),  # <-- No fixed key, so it uses userdata
-                               transitions={'succeeded': 'WAIT_FOR_REQUEST',  # For now, loop back
-                                            'aborted': 'WAIT_FOR_REQUEST'},
-                               remapping={'room_in': 'room'})  # <-- Pass the room from userdata
+        smach.StateMachine.add('GO_TO_DELIVERY_ROOM', NavigateTo(),
+                               transitions={'succeeded': 'CHECK_FOR_PERSON', 'aborted': 'GO_TO_FRONT_DESK'},
+                               remapping={'room_in': 'room'})
+
+        smach.StateMachine.add('CHECK_FOR_PERSON', CheckForPerson(),
+                               transitions={'person_found': 'ANNOUNCE_DELIVERY',
+                                            'person_not_found': 'GO_TO_FRONT_DESK',
+                                            'aborted': 'GO_TO_LOBBY'})
+
+        smach.StateMachine.add('ANNOUNCE_DELIVERY', Speak("I am here to deliver your {item}"),
+                               transitions={'succeeded': 'GO_TO_LOBBY'},  # <-- Updated transition
+                               remapping={'item_in': 'item'})
+
+        smach.StateMachine.add('GO_TO_FRONT_DESK', NavigateTo('D'),
+                               transitions={'succeeded': 'ANNOUNCE_FAILURE', 'aborted': 'GO_TO_LOBBY'})
+
+        smach.StateMachine.add('ANNOUNCE_FAILURE', Speak("I could not find anyone in the room to deliver the {item}"),
+                               transitions={'succeeded': 'GO_TO_LOBBY'},  # <-- Updated transition
+                               remapping={'item_in': 'item'})
+
+        # --- Final State to Return to Lobby ---
+        smach.StateMachine.add('GO_TO_LOBBY', NavigateTo('E'),
+                               transitions={'succeeded': 'WAIT_FOR_REQUEST', 'aborted': 'WAIT_FOR_REQUEST'})
 
     sis = smach_ros.IntrospectionServer('smach_server', sm, '/SM_ROOT')
     sis.start()
     outcome = sm.execute()
     rospy.spin()
     sis.stop()
+
 
 if __name__ == '__main__':
     try:
