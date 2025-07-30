@@ -1,0 +1,14 @@
+# ROS build files
+build/
+devel/
+install/
+
+# Log files
+*.log
+
+# Large model files
+yolo/*.weights
+
+# Python caches
+__pycache__/
+*.pyc
